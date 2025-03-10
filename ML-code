@@ -1,0 +1,140 @@
+import pandas as pd
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score
+from sklearn.model_selection import GridSearchCV
+from sklearn.preprocessing import LabelEncoder
+import matplotlib.pyplot as plt
+
+CSV_DATA = 'spreadspoke_scores.csv'
+
+# Here we find the winner of the game, as the
+# excel does not explicity say it
+def game_result(row):
+    if row['score_home'] > row['score_away']:
+        return 'home_win'
+    elif row['score_home'] < row['score_away']:
+        return 'away_win'
+    else:
+        return 'tie'
+
+df = pd.read_csv(CSV_DATA)
+
+# Excluding playoff games
+df = df[df['schedule_playoff'] == False]
+
+# Calculate game results
+df['game_result'] = df.apply(game_result, axis=1)
+
+# Track the wins and losses for home and away teams as a whole
+df['home_wins'] = 0
+df['away_wins'] = 0
+
+# Store specific data for columms so we can track accuracy
+label_encoders = {}
+for column in ['team_home', 'team_away', 'team_favorite_id', 'stadium', 'weather_detail']:
+    df[column] = df[column].fillna('unknown')
+    le = LabelEncoder()
+    df[column] = le.fit_transform(df[column])
+    label_encoders[column] = le  # Store the encoder for later decoding
+
+# Home and away wins
+teams = set(df['team_home']).union(set(df['team_away']))
+for team in teams:
+    team_games = df[(df['team_home'] == team) | (df['team_away'] == team)]
+    home_wins = 0
+    away_wins = 0
+    for index, game in team_games.iterrows():
+        if game['team_home'] == team:
+            df.at[index, 'home_wins'] = home_wins
+            home_wins += (game['game_result'] == 'home_win')
+        if game['team_away'] == team:
+            df.at[index, 'away_wins'] = away_wins
+            away_wins += (game['game_result'] == 'away_win')
+
+# Add home advantage
+df['home_advantage'] = 0.08
+
+# Features to use for the model
+features = [
+    'score_home', 'score_away', 'spread_favorite', 'over_under_line', 'stadium_neutral', 
+    'weather_humidity', 'home_wins', 'away_wins', 'home_advantage', 
+    'team_home', 'team_away', 'team_favorite_id', 'stadium', 'weather_detail'
+]
+
+# Ensure all data is appropriately converted and fill NaNs
+for feature in features:
+    if feature in df.columns:
+        if df[feature].dtype not in [int, float]:
+            df[feature] = pd.to_numeric(df[feature], errors='coerce')
+        # Fill NaNs in numerical columns only
+        df[feature] = df[feature].fillna(df[feature].median())
+
+# Split into training and testing datasets
+# 2017-2022 (included) are training
+# 2023 is testing
+train_df = df[(df['schedule_season'] >= 2017) & (df['schedule_season'] <= 2022)]
+test_df = df[df['schedule_season'] == 2023]
+
+X_train = train_df[features]
+y_train = (train_df['game_result'] == 'home_win').astype(int)
+X_test = test_df[features]
+y_test = (test_df['game_result'] == 'home_win').astype(int)
+
+param_grid = {
+    'n_estimators': [100, 200],
+    'max_depth': [5, 10, 15],
+    'min_samples_split': [2, 5],
+    'min_samples_leaf': [1, 2]
+}
+
+# Random Forest Classifier: GridSearchCV
+grid_search = GridSearchCV(RandomForestClassifier(random_state=42), param_grid, cv=5, n_jobs=-1)
+grid_search.fit(X_train, y_train)
+
+# Get the best model from grid search
+best_model = grid_search.best_estimator_
+
+# Test the model on 2023 data
+y_pred_2023 = best_model.predict(X_test)
+accuracy_2023 = accuracy_score(y_test, y_pred_2023)
+print(f"2023 Predictions Accuracy: {accuracy_2023}")
+
+# Prepare data for the 2023 season with predictions
+test_df['predicted_game_result'] = ['home_win' if pred == 1 else 'away_win' for pred in y_pred_2023]
+
+# Decode team names from their encoded values
+test_df['team_home_name'] = label_encoders['team_home'].inverse_transform(test_df['team_home'])
+test_df['team_away_name'] = label_encoders['team_away'].inverse_transform(test_df['team_away'])
+
+# Teams to exclude
+# These teams are no longer around and will play zero games in the 2023 season
+exclude_teams = [
+    "Phoenix Cardinals", "Oakland Raiders", "San Diego Chargers", "Los Angeles Raiders", 
+    "Houston Oilers", "St. Louis Cardinals", "St. Louis Rams", "Tennessee Oilers", 
+    "Boston Patriots", "Baltimore Colts", "Washington Football Team", "Washington Redskins"
+]
+
+# Calculate the predicted total wins and losses for each team according to model
+team_records = {}
+for team in label_encoders['team_home'].classes_:
+    if team not in exclude_teams:
+        team_games = test_df[(test_df['team_home_name'] == team) | (test_df['team_away_name'] == team)]
+        wins = (
+            ((team_games['team_home_name'] == team) & (team_games['predicted_game_result'] == 'home_win')).sum()
+            + ((team_games['team_away_name'] == team) & (team_games['predicted_game_result'] == 'away_win')).sum()
+        )
+        losses = len(team_games) - wins
+        team_records[team] = {'Wins': wins, 'Losses': losses}
+
+records_df = pd.DataFrame(team_records).T.sort_values(by='Wins', ascending=False)
+
+# Plot the predicted total wins and losses as a bar chart
+fig, ax = plt.subplots(figsize=(15, 8))
+records_df.plot(kind='bar', stacked=True, ax=ax, color=['green', 'red'])
+ax.set_title('Predicted Total Wins and Losses for 2023 Regular Season')
+ax.set_xlabel('Teams')
+ax.set_ylabel('Number of Games')
+ax.legend(title='Results')
+plt.xticks(rotation=45, ha='right')
+plt.tight_layout()
+plt.show()
